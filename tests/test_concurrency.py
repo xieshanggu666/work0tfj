@@ -69,17 +69,27 @@ def _tx_snapshot_consistent(db, account_id):
         .all()
     )
     signs = {
-        "allocation": 1, "buy": 1, "transfer_in": 1,
-        "sell": -1, "transfer_out": -1, "offset": -1, "clear": -1,
+        "allocation": 1, "buy": 1, "transfer_in": 1, "unfreeze": 0, "reverse": 1,
+        "sell": -1, "transfer_out": -1, "offset": -1,
+        "freeze": 0, "settlement": -1, "clear": -1,
     }
+    frozen_signs = {"freeze": 1, "settlement": -1, "unfreeze": -1}
     expected = 0.0
+    expected_frozen = 0.0
     for tx in txs:
         expected = round(expected + signs[tx.tx_type] * float(tx.amount), 4)
+        expected_frozen = round(
+            expected_frozen + frozen_signs.get(tx.tx_type, 0) * float(tx.amount), 4
+        )
         assert float(tx.balance_after) == approx(expected), (
             f"流水 #{tx.id} 快照 {tx.balance_after} 与推算余额 {expected} 不一致"
         )
+        assert float(tx.frozen_after or 0) == approx(expected_frozen), (
+            f"流水 #{tx.id} 冻结快照 {tx.frozen_after} 与推算冻结 {expected_frozen} 不一致"
+        )
     account = db.get(AllowanceAccount, account_id)
     assert float(account.current_balance) == approx(expected)
+    assert float(account.frozen_balance) == approx(expected_frozen)
     return expected, txs
 
 
@@ -355,3 +365,214 @@ class TestConcurrentClear:
         assert record.status == "deficit"
         assert float(record.deficit) == approx(emission)
         assert db.query(AllowanceTransaction).count() == 0
+
+
+class TestConcurrentFreezeSettlement:
+    """报告批准冻结 / 冻结结算 / 交易并发：冻结额度安全、结算不重复、快照链一致。"""
+
+    def _approved(self, db, seed, activity_qty=1000, quota=1000):
+        """核算 → 分配 → 生成报告 → 提交 → 批准（冻结）。"""
+        from app.services.calculation_service import annual_total, recalc_company_year
+        from app.services.mrv_service import approve_report, generate_report, submit_report
+
+        db.add(
+            ActivityData(
+                company_id=seed["company"].id, scope_id=seed["scope2"].id, year=2025,
+                period="monthly", activity_type="外购电力", unit="MWh",
+                quantity=activity_qty, data_source="台账", verified=1,
+            )
+        )
+        db.commit()
+        recalc_company_year(db, seed["company"].id, 2025)
+        allocate_quota(db, seed["company"].id, 2025, 1000, quota, 0)
+        report = generate_report(db, seed["company"].id, 2025)
+        submit_report(db, report)
+        approve_report(db, report, verifier_id=1)
+        return annual_total(db, seed["company"].id, 2025)
+
+    def test_parallel_settlement_settles_once(self, db, seed):
+        """已批准冻结后 5 个线程并发清缴：只结算一次，金额恰为排放量。"""
+        emission = self._approved(db, seed, activity_qty=1000, quota=1000)
+        account_id = db.query(AllowanceAccount).first().id
+
+        def worker():
+            session = _fresh_session(db)
+            try:
+                rec = clear_emission(session, seed["company"].id, 2025, "2025-12-31")
+                return rec.id, rec.status, float(rec.cleared_amount)
+            finally:
+                session.close()
+
+        with ThreadPoolExecutor(max_workers=5) as pool:
+            records = list(pool.map(lambda _: worker(), range(5)))
+
+        db.expire_all()
+        assert len({rid for rid, _, _ in records}) == 1
+        for _, status, cleared in records:
+            assert status == "compliant"
+            assert cleared == approx(emission)
+        balance, txs = _tx_snapshot_consistent(db, account_id)
+        settlements = [t for t in txs if t.tx_type == "settlement"]
+        assert len(settlements) == 1
+        assert balance == approx(1000 - emission)
+        assert db.query(ComplianceRecord).count() == 1
+
+    def test_sell_and_settlement_concurrent(self, db, seed):
+        """冻结结算与卖出并发：冻结未释放前不可被卖，结束后总额守恒、快照链一致。"""
+        emission = self._approved(db, seed, activity_qty=1000, quota=2000)
+        account_id = db.query(AllowanceAccount).first().id
+        errors = []
+        sold = []
+
+        def do_settle():
+            session = _fresh_session(db)
+            try:
+                clear_emission(session, seed["company"].id, 2025, "2025-12-31")
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
+            finally:
+                session.close()
+
+        def do_sell():
+            session = _fresh_session(db)
+            try:
+                account = session.get(AllowanceAccount, account_id)
+                tx = transfer(session, account, 100, "sell", tx_date="2025-12-30")
+                sold.append(float(tx.amount))
+            except ValueError:
+                pass  # 冻结尚未结算时可用余额为 0，拒绝卖出是正确行为
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
+            finally:
+                session.close()
+
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            futures = [pool.submit(do_settle)] + [pool.submit(do_sell) for _ in range(5)]
+            for f in futures:
+                f.result()
+
+        db.expire_all()
+        assert not errors, f"并发出现非预期异常：{errors!r}"
+        _tx_snapshot_consistent(db, account_id)
+        record = db.query(ComplianceRecord).one()
+        assert record.status == "compliant"
+        assert float(record.cleared_amount) == approx(emission)
+        # 结算先于卖出时卖出可成交、反之被拒；任何顺序下两者之和不超过初始余额 2000
+        sold_total = sum(sold)
+        assert sold_total + float(record.cleared_amount) <= 2000 + 1e-6
+        assert float(db.get(AllowanceAccount, account_id).current_balance) == approx(
+            2000 - sold_total - float(record.cleared_amount)
+        )
+
+    def test_parallel_approve_creates_single_freeze(self, db, seed):
+        """5 个线程并发批准同一 submitted 报告：仅一笔成功、仅一条冻结记录。"""
+        from app.services.freeze_service import freeze_on_approval
+
+        # 核算 → 分配 → 报告生成并提交（不批准）
+        from app.services.calculation_service import annual_total, recalc_company_year
+        from app.services.mrv_service import generate_report, submit_report
+
+        db.add(
+            ActivityData(
+                company_id=seed["company"].id, scope_id=seed["scope2"].id, year=2025,
+                period="monthly", activity_type="外购电力", unit="MWh",
+                quantity=500, data_source="台账", verified=1,
+            )
+        )
+        db.commit()
+        recalc_company_year(db, seed["company"].id, 2025)
+        allocate_quota(db, seed["company"].id, 2025, 1000, 1000, 0)
+        report = generate_report(db, seed["company"].id, 2025)
+        submit_report(db, report)
+        report_id = report.id
+        account_id = db.query(AllowanceAccount).first().id
+        emission = annual_total(db, seed["company"].id, 2025)
+        db.expire_all()
+
+        outcomes = []
+
+        def worker():
+            from app.models import MrvReport
+
+            session = _fresh_session(db)
+            try:
+                rpt = session.get(MrvReport, report_id)
+                freeze_on_approval(session, rpt, verifier_id=1)
+                outcomes.append("ok")
+            except ValueError:
+                outcomes.append("reject")
+            finally:
+                session.close()
+
+        with ThreadPoolExecutor(max_workers=5) as pool:
+            list(pool.map(lambda _: worker(), range(5)))
+
+        db2 = _fresh_session(db)
+        try:
+            assert outcomes.count("ok") == 1
+            assert outcomes.count("reject") == 4
+            from app.models import AllowanceFreeze, MrvReport
+
+            assert db2.query(AllowanceFreeze).count() == 1
+            assert db2.query(AllowanceTransaction).filter(
+                AllowanceTransaction.tx_type == "freeze"
+            ).count() == 1
+            rpt = db2.get(MrvReport, report_id)
+            assert rpt.status == "approved"
+            acc = db2.get(AllowanceAccount, account_id)
+            assert float(acc.frozen_balance) == approx(emission)
+            _tx_snapshot_consistent(db2, account_id)
+        finally:
+            db2.close()
+
+    def test_topup_concurrent_with_settlement(self, db, seed):
+        """缺口批准：买入与清缴并发，结束后快照链/冻结/履约三方一致。"""
+        self._approved(db, seed, activity_qty=2000, quota=800)
+        account_id = db.query(AllowanceAccount).first().id
+        errors = []
+
+        def buy_then_clear():
+            session = _fresh_session(db)
+            try:
+                account = session.get(AllowanceAccount, account_id)
+                transfer(session, account, 200, "buy", counterparty="交易所", tx_date="2025-12-20")
+                clear_emission(session, seed["company"].id, 2025, "2025-12-31")
+            except ValueError:
+                pass  # 并发下部分清缴仍缺口/余额不足均合法
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
+            finally:
+                session.close()
+
+        def clear_only():
+            session = _fresh_session(db)
+            try:
+                clear_emission(session, seed["company"].id, 2025, "2025-12-31")
+            except ValueError:
+                pass
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
+            finally:
+                session.close()
+
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futures = [pool.submit(buy_then_clear) for _ in range(2)]
+            futures += [pool.submit(clear_only) for _ in range(2)]
+            for f in futures:
+                f.result()
+
+        db.expire_all()
+        assert not errors, f"并发补缴出现非预期异常：{errors!r}"
+        _tx_snapshot_consistent(db, account_id)
+        record = db.query(ComplianceRecord).one()
+        # 已清缴不超过排放量
+        assert float(record.cleared_amount) <= 2000 * 0.5703 + 1e-6
+        account = db.get(AllowanceAccount, account_id)
+        # 余额恒等式：初始 800 + 买入合计 - 已清缴 = 当前余额
+        bought = sum(
+            float(t.amount)
+            for t in db.query(AllowanceTransaction).filter(AllowanceTransaction.tx_type == "buy").all()
+        )
+        assert float(account.current_balance) == approx(
+            800 + bought - float(record.cleared_amount)
+        )

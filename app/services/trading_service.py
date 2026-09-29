@@ -2,8 +2,9 @@
 
 并发安全保证：
 - 账户级键锁串行化同一账户的所有余额变更；
-- 余额扣减使用带非负条件的原子 UPDATE，并发下也不会超额扣减；
-- 余额与流水在同一事务中提交，异常统一回滚；
+- 卖出/划出使用带“可用余额（current_balance - frozen_balance）非负”条件的
+  原子 UPDATE，报告批准后已履约冻结的配额无法被交易占用；
+- 余额、冻结额与流水在同一事务中提交，异常统一回滚；
 - 支持幂等键，重复提交（双击、网络重试）返回首笔流水，不重复入账。
 """
 
@@ -20,8 +21,10 @@ from app.core.ledger import (
 )
 from app.models.allowance import AllowanceAccount, AllowanceTransaction
 
+# unfreeze 为冲正退回专用（current 不变、frozen 减少，由冻结服务调用），
+# settlement/clear/freeze 同理属于履约链路，均不走交易接口
 _INCREASE_TYPES = {"allocation", "buy", "transfer_in"}
-_DECREASE_TYPES = {"sell", "transfer_out", "offset", "clear"}
+_DECREASE_TYPES = {"sell", "transfer_out", "offset"}
 
 
 def transfer(
@@ -76,6 +79,7 @@ def transfer(
                     price=round(price, 2) if price is not None else None,
                     tx_date=tx_date,
                     balance_after=balance_after,
+                    frozen_after=float(account.frozen_balance),
                     remark=remark,
                     idempotency_key=idempotency_key,
                 )

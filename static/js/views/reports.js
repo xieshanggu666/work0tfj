@@ -41,6 +41,20 @@ views.ReportsView = () => {
     }
   };
 
+  const reverse = async (id) => {
+    const reason = prompt("冲正将解除已冻结配额、退回已清缴配额，履约状态回退。请填写冲正原因：");
+    if (reason === null) return;
+    if (!reason.trim()) { setMsg({ type: "err", text: "冲正必须填写原因" }); return; }
+    try {
+      const r = await api.post(`/api/reports/${id}/reverse`, { reason: reason.trim() });
+      setMsg({ type: "ok", text: `报告已冲正回退（第 ${r.version} 版），可修订数据后重新生成提交` });
+      loadReports(selCompany);
+      setDetail(null);
+    } catch (err) {
+      setMsg({ type: "err", text: err.message });
+    }
+  };
+
   const showDetail = async (id) => {
     try {
       const d = await api.get(`/api/reports/${id}`);
@@ -64,24 +78,26 @@ views.ReportsView = () => {
       </div>
       ${msg.text && html`<div class="msg ${msg.type}">${msg.text}</div>`}
       <table>
-        <thead><tr><th>年度</th><th>范围一</th><th>范围二</th><th>范围三</th><th>排放合计 (tCO2e)</th><th>状态</th><th>生成时间</th><th></th></tr></thead>
+        <thead><tr><th>年度</th><th>版本</th><th>范围一</th><th>范围二</th><th>范围三</th><th>排放合计 (tCO2e)</th><th>状态</th><th>生成时间</th><th></th></tr></thead>
         <tbody>
           ${reports.map((r) => html`
             <tr key=${r.id}>
               <td>${r.year}</td>
+              <td class="mono">v${r.version || 1}</td>
               <td>${fmtNum(r.scope1)}</td>
               <td>${fmtNum(r.scope2)}</td>
               <td>${fmtNum(r.scope3)}</td>
               <td style=${{fontWeight: "600"}}>${fmtNum(r.total_emission)}</td>
-              <td>${html([StatusBadge(r.status)])}</td>
+              <td>${html([StatusBadge(r.status, reportStatusOverrides)])}${r.reverse_reason ? html`<div style=${{fontSize: "11px", color: "var(--text-dim)", maxWidth: "160px"}} title=${r.reverse_reason}>${r.reverse_reason}</div>` : ""}</td>
               <td>${new Date(r.generated_at).toLocaleDateString("zh-CN")}</td>
               <td style=${{whiteSpace: "nowrap"}}>
                 <button class="btn ghost sm" onClick=${() => showDetail(r.id)}>详情</button>
-                ${r.status === "draft" && canSubmit && html`<button class="btn ghost sm" onClick=${() => action(r.id, "submit")}>提交</button>`}
+                ${["draft", "pending"].includes(r.status) && canSubmit && html`<button class="btn ghost sm" onClick=${() => action(r.id, "submit")}>提交</button>`}
                 ${r.status === "submitted" && isVerifier && html`<button class="btn sm" onClick=${() => action(r.id, "approve")}>批准</button>`}
+                ${r.status === "approved" && isVerifier && html`<button class="btn danger sm" onClick=${() => reverse(r.id)}>冲正</button>`}
               </td>
             </tr>`)}
-          ${reports.length === 0 && html`<tr><td colspan="8" class="empty">暂无报告，选择企业后生成</td></tr>`}
+          ${reports.length === 0 && html`<tr><td colspan="9" class="empty">暂无报告，选择企业后生成</td></tr>`}
         </tbody>
       </table>
     </div>

@@ -9,7 +9,7 @@ from app.services.calculation_service import (
     recalc_company_year,
     scope_totals,
 )
-from app.services.mrv_service import approve_report, generate_report, submit_report
+from app.services.mrv_service import approve_report, generate_report, reverse_report, submit_report
 from app.services.quota_service import allocate_quota, clear_emission
 from app.services.trading_service import transfer
 
@@ -170,10 +170,11 @@ class TestTrading:
 
 class TestMrvReport:
     def test_generate_submit_approve_workflow(self, db, seed):
-        """报告生成 → 提交 → 批准完整流转。"""
+        """报告生成 → 提交 → 批准完整流转，批准同时冻结配额。"""
         _add_activity(db, seed, seed["scope2"], 2025, "外购电力", 2000, "MWh")
         recalc_company_year(db, seed["company"].id, 2025)
         total = annual_total(db, seed["company"].id, 2025)
+        allocate_quota(db, seed["company"].id, 2025, baseline=1000, allocation_amount=10000, adjustment=0)
 
         report = generate_report(db, seed["company"].id, 2025)
         assert report.status == "draft"
@@ -182,8 +183,17 @@ class TestMrvReport:
         submit_report(db, report)
         assert report.status == "submitted"
 
-        approve_report(db, report, verifier_id=1)
+        from app.models import AllowanceAccount, ComplianceRecord
+
+        account = db.query(AllowanceAccount).first()
+        report, record = approve_report(db, report, verifier_id=1)
         assert report.status == "approved"
+        # 批准即冻结：冻结额等于排放量，可用余额相应减少，履约状态 frozen
+        assert float(record.frozen_amount) == approx(total)
+        assert float(account.frozen_balance) == approx(total)
+        assert float(account.current_balance) == approx(10000)
+        assert account.available_balance == approx(10000 - total)
+        assert record.status == "frozen"
 
     def test_approve_without_submit_rejected(self, db, seed):
         """草稿不可直接批准。"""
@@ -194,10 +204,21 @@ class TestMrvReport:
             approve_report(db, report, verifier_id=1)
 
     def test_regenerate_resets_to_draft(self, db, seed):
-        """重新生成报告重置为草稿。"""
+        """冲正退回（pending）后重新生成报告重置为草稿；已提交不可直接重建。"""
         _add_activity(db, seed, seed["scope2"], 2025, "外购电力", 2000, "MWh")
         recalc_company_year(db, seed["company"].id, 2025)
+        allocate_quota(db, seed["company"].id, 2025, baseline=1000, allocation_amount=10000, adjustment=0)
         report = generate_report(db, seed["company"].id, 2025)
         submit_report(db, report)
+        # 已提交待核查：不允许直接重新生成，避免绕过核查
+        with pytest.raises(ValueError, match="已提交"):
+            generate_report(db, seed["company"].id, 2025)
+        approve_report(db, report, verifier_id=1)
+        # 批准后也不可重建，必须先冲正
+        with pytest.raises(ValueError, match="冲正"):
+            generate_report(db, seed["company"].id, 2025)
+        reverse_report(db, report, reason="因子取值有误", user_id=1)
+        assert report.status == "pending"
         report = generate_report(db, seed["company"].id, 2025)
         assert report.status == "draft"
+        assert report.version == 2

@@ -59,3 +59,9 @@ class TransferIn(BaseModel):
     remark: str = ""
     # 客户端幂等键：同账户相同键的重复提交只入账一次（也可用 Idempotency-Key 请求头）
     idempotency_key: str | None = None
+
+
+class ReverseIn(BaseModel):
+    """报告冲正：必须填写原因，触发冻结解除与清缴配额退回。"""
+
+    reason: str = Field(min_length=1, max_length=256)

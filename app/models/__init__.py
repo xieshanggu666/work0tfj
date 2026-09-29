@@ -1,5 +1,6 @@
 from app.models.allowance import (
     AllowanceAccount,
+    AllowanceFreeze,
     AllowanceTransaction,
     ComplianceRecord,
     Quota,
@@ -27,6 +28,7 @@ __all__ = [
     "Quota",
     "AllowanceAccount",
     "AllowanceTransaction",
+    "AllowanceFreeze",
     "ComplianceRecord",
     "MrvReport",
 ]

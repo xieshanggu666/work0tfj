@@ -22,7 +22,7 @@ from app.models import (  # noqa: E402
 )
 from app.services.calculation_service import recalc_company_year  # noqa: E402
 from app.services.quota_service import allocate_quota, clear_emission  # noqa: E402
-from app.services.mrv_service import generate_report  # noqa: E402
+from app.services.mrv_service import approve_report, generate_report, submit_report  # noqa: E402
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
@@ -104,16 +104,22 @@ def main():
         recalc_company_year(db, c.id, year)
 
     allocate_quota(db, companies[0].id, year, baseline=2200000, allocation_amount=2150000, adjustment=-30000)
-    allocate_quota(db, companies[1].id, year, baseline=560000, allocation_amount=540000, adjustment=-10000)
+    allocate_quota(db, companies[1].id, year, baseline=560000, allocation_amount=400000, adjustment=-10000)
+
+    # 闭环演示：企业生成报告并提交 → 核查员批准（按核查排放量冻结配额）
+    # → 管理员清缴（冻结结算）。绿能电力配额充足，清缴后达标；
+    # 恒固水泥配额不足，批准后处于缺口状态，供演示买入补缴。
+    for c in companies:
+        report = generate_report(db, c.id, year)
+        submit_report(db, report)
+        approve_report(db, report, verifier_id=users[1].id)
 
     clear_emission(db, companies[0].id, year, f"{year}-12-31")
 
-    for c in companies:
-        generate_report(db, c.id, year)
-
     db.commit()
     db.close()
-    print("初始化完成：2 家企业、4 个核算边界、3 个排放因子、4 条活动数据（2025）、2 份配额、1 条履约记录、2 份 MRV 报告")
+    print("初始化完成：2 家企业、4 个核算边界、3 个排放因子、4 条活动数据（2025）、2 份配额")
+    print("闭环数据：2 份已批准 MRV 报告（批准即冻结）；绿能电力已清缴达标，恒固水泥处于配额缺口（可买入后清缴补缴）")
     print("账号：admin / verifier / elec / cement，密码均为 123456")
 
 

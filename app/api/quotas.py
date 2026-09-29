@@ -3,7 +3,7 @@ from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.core.deps import ensure_company_access, get_current_user, require_roles
-from app.models import AllowanceAccount, AllowanceTransaction, ComplianceRecord, Quota, User
+from app.models import AllowanceAccount, AllowanceFreeze, AllowanceTransaction, ComplianceRecord, Quota, User
 from app.schemas import QuotaIn, TransferIn
 from app.services.quota_service import allocate_quota, clear_emission
 from app.services.trading_service import transfer
@@ -57,6 +57,7 @@ def company_account(company_id: int, year: int, db: Session = Depends(get_db), u
         "opening_balance": float(account.opening_balance),
         "current_balance": float(account.current_balance),
         "frozen_balance": float(account.frozen_balance),
+        "available_balance": account.available_balance,
     }
 
 
@@ -110,9 +111,40 @@ def account_transactions(account_id: int, db: Session = Depends(get_db), user: U
             "price": float(t.price) if t.price is not None else None,
             "tx_date": t.tx_date,
             "balance_after": float(t.balance_after),
+            "frozen_after": float(t.frozen_after or 0),
+            "freeze_id": t.freeze_id,
             "remark": t.remark,
         }
         for t in txs
+    ]
+
+
+@router.get("/companies/{company_id}/freezes")
+def list_freezes(company_id: int, year: int | None = None, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    """履约冻结记录：批准冻结/结算/冲正全生命周期，受同一企业归属边界保护。"""
+    ensure_company_access(user, company_id, "无权查看该企业冻结记录")
+    q = db.query(AllowanceFreeze).filter(AllowanceFreeze.company_id == company_id)
+    if year is not None:
+        q = q.filter(AllowanceFreeze.year == year)
+    items = q.order_by(AllowanceFreeze.id.desc()).all()
+    return [
+        {
+            "id": f.id,
+            "company_id": f.company_id,
+            "year": f.year,
+            "account_id": f.account_id,
+            "report_id": f.report_id,
+            "approved_amount": float(f.approved_amount),
+            "frozen_amount": float(f.frozen_amount),
+            "settled_amount": float(f.settled_amount),
+            "reversed_amount": float(f.reversed_amount),
+            "status": f.status,
+            "reason": f.reason,
+            "created_at": f.created_at,
+            "settled_at": f.settled_at,
+            "reversed_at": f.reversed_at,
+        }
+        for f in items
     ]
 
 
@@ -131,9 +163,11 @@ def list_compliance(year: int | None = None, db: Session = Depends(get_db), user
             "year": r.year,
             "verified_emission": float(r.verified_emission),
             "cleared_amount": float(r.cleared_amount),
+            "frozen_amount": float(r.frozen_amount),
             "deficit": float(r.deficit),
             "status": r.status,
             "deadline": r.deadline,
+            "approved_report_id": r.approved_report_id,
             "cleared_at": r.cleared_at,
         }
         for r in items
@@ -161,5 +195,6 @@ def do_clear(
         "status": record.status,
         "verified_emission": float(record.verified_emission),
         "cleared_amount": float(record.cleared_amount),
+        "frozen_amount": float(record.frozen_amount),
         "deficit": float(record.deficit),
     }

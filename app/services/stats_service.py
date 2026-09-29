@@ -22,8 +22,29 @@ def dashboard_stats(db: Session, year: int | None = None) -> dict:
     cleared_total = (
         db.query(func.coalesce(func.sum(ComplianceRecord.cleared_amount), 0)).scalar() or 0
     )
-    compliant = db.query(ComplianceRecord).filter(ComplianceRecord.status == "compliant").count()
-    deficit = db.query(ComplianceRecord).filter(ComplianceRecord.status == "deficit").count()
+    # 已冻结待结算配额：报告批准后锁定、尚未实际清缴的部分
+    frozen_total = (
+        db.query(func.coalesce(func.sum(ComplianceRecord.frozen_amount), 0)).scalar() or 0
+    )
+    outstanding_deficit = (
+        db.query(func.coalesce(func.sum(ComplianceRecord.deficit), 0)).scalar() or 0
+    )
+    # 账户侧：总持仓、冻结、可用三者由流水实时推导，与履约侧冻结互为对账
+    holding_total = (
+        db.query(func.coalesce(func.sum(AllowanceAccount.current_balance), 0)).scalar() or 0
+    )
+    account_frozen_total = (
+        db.query(func.coalesce(func.sum(AllowanceAccount.frozen_balance), 0)).scalar() or 0
+    )
+
+    status_rows = (
+        db.query(ComplianceRecord.status, func.count(ComplianceRecord.id))
+        .group_by(ComplianceRecord.status)
+        .all()
+    )
+    counts = {"pending": 0, "frozen": 0, "compliant": 0, "deficit": 0}
+    for status, cnt in status_rows:
+        counts[status] = cnt
 
     return {
         "total_companies": total_companies,
@@ -32,6 +53,11 @@ def dashboard_stats(db: Session, year: int | None = None) -> dict:
         "emission_total": round(float(emission_total), 4),
         "quota_total": round(float(quota_total), 4),
         "cleared_total": round(float(cleared_total), 4),
-        "compliance_counts": {"compliant": compliant, "deficit": deficit},
+        "frozen_total": round(float(frozen_total), 4),
+        "outstanding_deficit": round(float(outstanding_deficit), 4),
+        "holding_total": round(float(holding_total), 4),
+        "account_frozen_total": round(float(account_frozen_total), 4),
+        "available_total": round(float(holding_total) - float(account_frozen_total), 4),
+        "compliance_counts": counts,
         "accounts": db.query(AllowanceAccount).count(),
     }

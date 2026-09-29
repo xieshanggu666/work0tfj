@@ -4,6 +4,7 @@ views.QuotaView = () => {
   const [compliance, setCompliance] = React.useState([]);
   const [account, setAccount] = React.useState(null);
   const [txs, setTxs] = React.useState([]);
+  const [freezes, setFreezes] = React.useState([]);
   const [selCompany, setSelCompany] = React.useState("");
   const [selYear, setSelYear] = React.useState(2025);
   const [form, setForm] = React.useState({ company_id: "", year: 2025, baseline: "", allocation_amount: "", adjustment: "" });
@@ -29,11 +30,16 @@ views.QuotaView = () => {
     try {
       const acc = await api.get(`/api/companies/${selCompany}/account?year=${selYear}`);
       setAccount(acc);
-      const t = await api.get(`/api/accounts/${acc.id}/transactions`);
+      const [t, f] = await Promise.all([
+        api.get(`/api/accounts/${acc.id}/transactions`),
+        api.get(`/api/companies/${selCompany}/freezes?year=${selYear}`),
+      ]);
       setTxs(t);
+      setFreezes(f);
     } catch (err) {
       setAccount(null);
       setTxs([]);
+      setFreezes([]);
       setMsg({ type: "err", text: err.message });
     }
   };
@@ -83,11 +89,17 @@ views.QuotaView = () => {
   };
 
   const doClear = async (c) => {
-    if (!confirm(`确认对 ${c.name}（${c.year} 年）执行履约清缴？`)) return;
+    const tip = c.status === "frozen"
+      ? `确认对 ${c.name}（${c.year} 年）执行清缴？已冻结配额将结算为已清缴。`
+      : `确认对 ${c.name}（${c.year} 年）执行履约清缴？`;
+    if (!confirm(tip)) return;
     try {
       // 清缴幂等键：重复点击/超时重发返回同一履约记录，不重复扣减
       const r = await api.post(`/api/companies/${c.company_id}/clear?year=${c.year}&deadline=${c.year}-12-31`, null, api.idemKey());
-      setMsg({ type: "ok", text: `清缴完成：状态 ${r.status}，缺口 ${fmtNum(r.deficit)} 吨` });
+      const tip2 = r.status === "compliant"
+        ? `清缴完成：履约达标，已清缴 ${fmtNum(r.cleared_amount)} 吨`
+        : `清缴完成：状态 ${r.status}，缺口 ${fmtNum(r.deficit)} 吨（可买入后再次清缴补缴）`;
+      setMsg({ type: "ok", text: tip2 });
       api.get("/api/compliance").then(setCompliance);
       loadAccount();
     } catch (err) {
@@ -137,7 +149,8 @@ views.QuotaView = () => {
         <div class="cards">
           <div class="card"><div class="label">期初配额</div><div class="value">${fmtNum(account.opening_balance)} t</div></div>
           <div class="card"><div class="label">当前余额</div><div class="value">${fmtNum(account.current_balance)} t</div></div>
-          <div class="card"><div class="label">冻结配额</div><div class="value">${fmtNum(account.frozen_balance)} t</div></div>
+          <div class="card"><div class="label">冻结配额</div><div class="value">${fmtNum(account.frozen_balance)} t</div><div class="sub">报告批准锁定，结算后释放</div></div>
+          <div class="card"><div class="label">可用余额</div><div class="value">${fmtNum(account.available_balance ?? (account.current_balance - account.frozen_balance))} t</div><div class="sub">交易可动用额度</div></div>
         </div>
         <form class="form-grid" onSubmit=${doTransfer}>
           <div class="field"><label>类型</label>
@@ -154,7 +167,7 @@ views.QuotaView = () => {
           <div class="actions"><button class="btn" type="submit" disabled=${submitting}>${submitting ? "提交中…" : "提交交易"}</button></div>
         </form>
         <table style=${{marginTop: "16px"}}>
-          <thead><tr><th>ID</th><th>类型</th><th>数量 (t)</th><th>对手方</th><th>单价</th><th>日期</th><th>余额</th><th>备注</th></tr></thead>
+          <thead><tr><th>ID</th><th>类型</th><th>数量 (t)</th><th>对手方</th><th>单价</th><th>日期</th><th>余额</th><th>冻结</th><th>备注</th></tr></thead>
           <tbody>
             ${txs.map((t) => html`
               <tr key=${t.id}>
@@ -165,9 +178,29 @@ views.QuotaView = () => {
                 <td>${t.price !== null ? fmtNum(t.price) + " 元" : "-"}</td>
                 <td>${t.tx_date || "-"}</td>
                 <td>${fmtNum(t.balance_after)}</td>
+                <td>${fmtNum(t.frozen_after || 0)}</td>
                 <td>${t.remark || "-"}</td>
               </tr>`)}
-            ${txs.length === 0 && html`<tr><td colspan="8" class="empty">暂无交易记录</td></tr>`}
+            ${txs.length === 0 && html`<tr><td colspan="9" class="empty">暂无交易记录</td></tr>`}
+          </tbody>
+        </table>
+
+        <h4 style=${{marginTop: "20px"}}>履约冻结记录</h4>
+        <table>
+          <thead><tr><th>ID</th><th>报告</th><th>应冻结 (t)</th><th>冻结中 (t)</th><th>已结算 (t)</th><th>已冲正 (t)</th><th>状态</th><th>原因</th></tr></thead>
+          <tbody>
+            ${freezes.map((f) => html`
+              <tr key=${f.id}>
+                <td class="mono">#${f.id}</td>
+                <td>${f.report_id ? `#${f.report_id}` : "-"}</td>
+                <td>${fmtNum(f.approved_amount)}</td>
+                <td>${fmtNum(f.frozen_amount)}</td>
+                <td>${fmtNum(f.settled_amount)}</td>
+                <td>${fmtNum(f.reversed_amount)}</td>
+                <td>${html([StatusBadge(f.status)])}</td>
+                <td>${f.reason || "-"}</td>
+              </tr>`)}
+            ${freezes.length === 0 && html`<tr><td colspan="8" class="empty">暂无冻结记录，MRV 报告批准后自动冻结</td></tr>`}
           </tbody>
         </table>` : html`<div class="msg err">${msg.text || "该年度尚无配额账户，请先分配配额"}</div>`}
     </div>
@@ -175,7 +208,7 @@ views.QuotaView = () => {
     <div class="panel">
       <h3>年度履约</h3>
       <table>
-        <thead><tr><th>企业</th><th>年度</th><th>核查排放 (tCO2e)</th><th>已清缴 (t)</th><th>缺口 (t)</th><th>状态</th><th></th></tr></thead>
+        <thead><tr><th>企业</th><th>年度</th><th>核查排放 (tCO2e)</th><th>已清缴 (t)</th><th>已冻结 (t)</th><th>缺口 (t)</th><th>状态</th><th>操作</th></tr></thead>
         <tbody>
           ${compliance.map((r) => html`
             <tr key=${r.id}>
@@ -183,11 +216,12 @@ views.QuotaView = () => {
               <td>${r.year}</td>
               <td>${fmtNum(r.verified_emission)}</td>
               <td>${fmtNum(r.cleared_amount)}</td>
+              <td>${fmtNum(r.frozen_amount)}</td>
               <td>${fmtNum(r.deficit)}</td>
               <td>${html([StatusBadge(r.status)])}</td>
-              <td>${isAdmin && r.status === "pending" && html`<button class="btn sm" onClick=${() => doClear({ ...r, name: companies.find((c) => c.id === r.company_id)?.name })}>清缴</button>`}</td>
+              <td>${isAdmin && ["pending", "frozen", "deficit"].includes(r.status) && html`<button class="btn sm" onClick=${() => doClear({ ...r, name: companies.find((c) => c.id === r.company_id)?.name })}>${r.status === "deficit" ? "清缴/补缴" : "清缴结算"}</button>`}</td>
             </tr>`)}
-          ${compliance.length === 0 && html`<tr><td colspan="7" class="empty">暂无履约记录，核算并清缴后展示</td></tr>`}
+          ${compliance.length === 0 && html`<tr><td colspan="8" class="empty">暂无履约记录，报告批准冻结或清缴后展示</td></tr>`}
         </tbody>
       </table>
     </div>

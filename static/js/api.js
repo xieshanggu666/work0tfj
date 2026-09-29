@@ -32,22 +32,29 @@ const api = {
 const fmtNum = (v, digits = 2) =>
   v === null || v === undefined ? "-" : Number(v).toLocaleString("zh-CN", { minimumFractionDigits: digits, maximumFractionDigits: digits });
 
-const StatusBadge = (s) => {
+const StatusBadge = (s, overrides) => {
   const map = {
     active: ["active", "正常"],
     inactive: ["muted", "停用"],
     pending: ["warn", "待处理"],
     allocated: ["info", "已分配"],
     cleared: ["ok", "已清缴"],
+    frozen: ["info", "冻结待缴"],
+    settled: ["ok", "已结算"],
+    reversed: ["muted", "已冲正"],
     compliant: ["ok", "履约达标"],
     deficit: ["danger", "配额缺口"],
     draft: ["muted", "草稿"],
     submitted: ["info", "已提交"],
     approved: ["ok", "已批准"],
   };
-  const [cls, label] = map[s] || ["muted", s];
+  const found = overrides && overrides[s] ? overrides[s] : map[s];
+  const [cls, label] = found || ["muted", s];
   return `<span class="badge ${cls}">${label}</span>`;
 };
+
+// MRV 报告状态：pending 在报告语境表示“冲正退回”
+const reportStatusOverrides = { pending: ["warn", "冲正退回"] };
 
 const scopeLabel = (s) => ({ 1: "范围一", 2: "范围二", 3: "范围三" }[s] || s);
 const txLabel = {
@@ -58,4 +65,8 @@ const txLabel = {
   transfer_out: "转出",
   offset: "抵消",
   clear: "履约清缴",
+  freeze: "履约冻结",
+  settlement: "冻结结算",
+  unfreeze: "解除冻结",
+  reverse: "冲正退回",
 };
