@@ -41,6 +41,25 @@ views.ReportsView = () => {
     }
   };
 
+  const reverse = async (id) => {
+    const reason = prompt("请输入批准报告冲正原因（将解冻/退还相关配额）：", "");
+    if (reason === null) return;
+    if (reason.trim().length < 2) {
+      setMsg({ type: "err", text: "冲正原因至少 2 个字符" });
+      return;
+    }
+    if (!confirm("冲正将归档履约记录并回滚冻结、清缴结果，确认继续？")) return;
+    try {
+      const r = await api.post(`/api/reports/${id}/reverse`, { reason });
+      setMsg({ type: "err", text: "" });
+      setMsg({ type: "ok", text: `报告已冲正：${r.status}` });
+      loadReports(selCompany);
+      setDetail(null);
+    } catch (err) {
+      setMsg({ type: "err", text: err.message });
+    }
+  };
+
   const showDetail = async (id) => {
     try {
       const d = await api.get(`/api/reports/${id}`);
@@ -79,6 +98,7 @@ views.ReportsView = () => {
                 <button class="btn ghost sm" onClick=${() => showDetail(r.id)}>详情</button>
                 ${r.status === "draft" && canSubmit && html`<button class="btn ghost sm" onClick=${() => action(r.id, "submit")}>提交</button>`}
                 ${r.status === "submitted" && isVerifier && html`<button class="btn sm" onClick=${() => action(r.id, "approve")}>批准</button>`}
+                ${r.status === "approved" && isVerifier && html`<button class="btn danger sm" onClick=${() => reverse(r.id)}>冲正</button>`}
               </td>
             </tr>`)}
           ${reports.length === 0 && html`<tr><td colspan="8" class="empty">暂无报告，选择企业后生成</td></tr>`}
@@ -98,7 +118,9 @@ views.ReportsView = () => {
         <p style=${{color: "var(--text-dim)", fontSize: "12px"}}>
           状态：${detail.status} ｜ 生成：${new Date(detail.generated_at).toLocaleString("zh-CN")}
           ${detail.approved_at ? ` ｜ 批准：${new Date(detail.approved_at).toLocaleString("zh-CN")}` : ""}
+          ${detail.reversed_at ? ` ｜ 冲正：${new Date(detail.reversed_at).toLocaleString("zh-CN")}` : ""}
         </p>
+        ${detail.reversal_reason && html`<p style=${{color: "var(--red)", fontSize: "12px"}}>冲正原因：${detail.reversal_reason}</p>`}
         <pre style=${{background: "var(--bg-soft)", border: "1px solid var(--line)", borderRadius: "8px", padding: "14px", marginTop: "12px", overflow: "auto", fontSize: "12px"}}>${JSON.stringify(JSON.parse(detail.report_json || "{}"), null, 2)}</pre>
       </div>`}
   `;

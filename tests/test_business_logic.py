@@ -9,7 +9,12 @@ from app.services.calculation_service import (
     recalc_company_year,
     scope_totals,
 )
-from app.services.mrv_service import approve_report, generate_report, submit_report
+from app.services.mrv_service import (
+    approve_report,
+    generate_report,
+    reverse_report,
+    submit_report,
+)
 from app.services.quota_service import allocate_quota, clear_emission
 from app.services.trading_service import transfer
 
@@ -136,6 +141,165 @@ class TestQuotaAndCompliance:
         assert float(record.cleared_amount) == approx(800)
         assert float(record.deficit) == approx(emission - 800)
 
+class TestApprovalFreezeAndReversal:
+    def _calculated_report(self, db, seed, qty=1000, quota=1000):
+        _add_activity(db, seed, seed["scope2"], 2025, "外购电力", qty, "MWh")
+        recalc_company_year(db, seed["company"].id, 2025)
+        emission = annual_total(db, seed["company"].id, 2025)
+        allocate_quota(db, seed["company"].id, 2025, baseline=1000, allocation_amount=quota)
+        report = generate_report(db, seed["company"].id, 2025)
+        submit_report(db, report)
+        return emission, approve_report(db, report, verifier_id=1)
+
+    def test_approve_freezes_allowance_and_creates_pending_compliance(self, db, seed):
+        """报告批准后按排放快照冻结配额，交易可用余额减少，履约状态为待清缴。"""
+        from app.models import AllowanceAccount, AllowanceTransaction, ComplianceRecord
+
+        emission, report = self._calculated_report(db, seed, qty=1000, quota=1000)
+        account = db.query(AllowanceAccount).one()
+        record = db.query(ComplianceRecord).one()
+        freeze_tx = db.query(AllowanceTransaction).filter(AllowanceTransaction.tx_type == "freeze").one()
+
+        assert report.status == "approved"
+        assert float(record.verified_emission) == approx(emission)
+        assert float(record.frozen_amount) == approx(emission)
+        assert record.status == "pending"
+        assert float(account.current_balance) == approx(1000)
+        assert float(account.frozen_balance) == approx(emission)
+        assert float(freeze_tx.balance_after) == approx(1000)
+        assert float(freeze_tx.frozen_after) == approx(emission)
+
+    def test_frozen_allowance_cannot_be_sold(self, db, seed):
+        """批准冻结的配额不能通过卖出/划出占用。"""
+        from app.models import AllowanceAccount
+
+        self._calculated_report(db, seed, qty=1000, quota=1000)
+        account = db.query(AllowanceAccount).one()
+        with pytest.raises(ValueError, match="可用配额"):
+            transfer(db, account, 500, "sell", tx_date="2025-06-01")
+        db.refresh(account)
+        assert float(account.current_balance) == approx(1000)
+        assert float(account.frozen_balance) == approx(570.3)
+
+    def test_clear_consumes_frozen_quota_and_closes_compliance(self, db, seed):
+        """批准后清缴核销冻结配额：持仓和冻结额同步下降，履约达标。"""
+        from app.models import AllowanceAccount, ComplianceRecord
+
+        emission, _ = self._calculated_report(db, seed, qty=1000, quota=1000)
+        record = clear_emission(db, seed["company"].id, 2025, "2025-12-31")
+        account = db.query(AllowanceAccount).one()
+
+        assert record.status == "compliant"
+        assert float(record.cleared_amount) == approx(emission)
+        assert float(record.frozen_amount) == approx(0)
+        assert float(record.deficit) == approx(0)
+        assert float(account.current_balance) == approx(1000 - emission)
+        assert float(account.frozen_balance) == approx(0)
+
+    def test_partial_freeze_then_buy_topup_and_clear(self, db, seed):
+        """批准时可用不足形成缺口；市场买入后补缴，冻结部分和补缴部分分别留痕。"""
+        from app.models import AllowanceAccount, AllowanceTransaction, ComplianceRecord
+
+        emission, _ = self._calculated_report(db, seed, qty=2000, quota=800)
+        account = db.query(AllowanceAccount).one()
+        record = db.query(ComplianceRecord).one()
+        assert record.status == "deficit"
+        assert float(record.frozen_amount) == approx(800)
+        assert float(record.deficit) == approx(emission - 800)
+
+        first = clear_emission(db, seed["company"].id, 2025, "2025-12-31")
+        assert first.status == "deficit"
+        assert float(first.cleared_amount) == approx(800)
+        assert float(account.current_balance) == approx(0)
+
+        transfer(db, account, float(first.deficit), "buy", counterparty="交易所", tx_date="2025-12-20")
+        second = clear_emission(db, seed["company"].id, 2025, "2025-12-31")
+        assert second.status == "compliant"
+        assert float(second.cleared_amount) == approx(emission)
+        assert float(second.frozen_amount) == approx(0)
+        assert float(account.current_balance) == approx(0)
+        assert db.query(AllowanceTransaction).filter(
+            AllowanceTransaction.tx_type == "frozen_clear"
+        ).count() == 1
+
+    def test_reverse_unfreezes_and_refunds_cleared_allowance(self, db, seed):
+        """批准后清缴，再冲正报告：解冻未清缴部分、退还已清缴部分并归档履约。"""
+        from app.models import AllowanceAccount, ComplianceRecord, MrvReport
+
+        emission, report = self._calculated_report(db, seed, qty=1000, quota=1000)
+        clear_emission(db, seed["company"].id, 2025, "2025-12-31")
+        reversed_record = reverse_report(db, report, operator_id=1, reason="核查数据有误")
+
+        db.refresh(report)
+        account = db.query(AllowanceAccount).one()
+        assert report.status == "reversed"
+        assert reversed_record.status == "reversed"
+        assert reversed_record.is_active == 0
+        assert float(reversed_record.cleared_amount) == approx(emission)
+        assert float(reversed_record.frozen_amount) == approx(0)
+        assert float(account.current_balance) == approx(1000)
+        assert float(account.frozen_balance) == approx(0)
+        assert db.query(ComplianceRecord).filter(ComplianceRecord.is_active == 1).count() == 0
+        assert isinstance(report, MrvReport)
+
+    def test_reverse_failure_rolls_back_all_modules(self, db, seed, monkeypatch):
+        """冲正过程中任一步失败：报告、履约、余额和流水全部回滚。"""
+        from app.models import AllowanceAccount, AllowanceTransaction, ComplianceRecord, MrvReport
+        from app.services import quota_service
+
+        self._calculated_report(db, seed, qty=1000, quota=1000)
+
+        def fail_after_refresh(*args, **kwargs):
+            raise RuntimeError("模拟冲正异常")
+
+        monkeypatch.setattr(quota_service, "_add_ledger_tx", fail_after_refresh)
+        with pytest.raises(RuntimeError):
+            report = db.query(MrvReport).one()
+            reverse_report(db, report, operator_id=1, reason="异常回滚测试")
+
+        db.rollback()
+        db.expire_all()
+        account = db.query(AllowanceAccount).one()
+        report = db.query(MrvReport).one()
+        record = db.query(ComplianceRecord).one()
+        assert report.status == "approved"
+        assert record.status == "pending"
+        assert record.is_active == 1
+        assert float(account.frozen_balance) == approx(570.3)
+        assert db.query(AllowanceTransaction).filter(
+            AllowanceTransaction.tx_type == "reversal"
+        ).count() == 0
+
+    def test_approved_report_cannot_be_regenerated_without_reversal(self, db, seed):
+        """已批准报告不能被重新生成直接覆盖，必须先冲正。"""
+        _, _ = self._calculated_report(db, seed)
+        with pytest.raises(ValueError, match="先冲正"):
+            generate_report(db, seed["company"].id, 2025)
+
+    def test_dashboard_stats_follow_year_and_account_boundary(self, db, seed):
+        """统计按年度汇总账户、冻结和履约活跃记录。"""
+        from app.models import User
+        from app.services.stats_service import dashboard_stats
+
+        self._calculated_report(db, seed, qty=1000, quota=1000)
+        enterprise = User(
+            username="ent",
+            display_name="企业用户",
+            role="enterprise",
+            company_id=seed["company"].id,
+            password_hash="x",
+            salt="x",
+        )
+        db.add(enterprise)
+        db.commit()
+
+        stats = dashboard_stats(db, 2025, enterprise)
+        assert stats["frozen_total"] == approx(570.3)
+        assert stats["current_balance_total"] == approx(1000)
+        assert stats["available_total"] == approx(429.7)
+        assert stats["compliance_counts"]["pending"] == 1
+        assert stats["transaction_count"] >= 2
+        assert dashboard_stats(db, 2024, enterprise)["frozen_total"] == approx(0)
 
 class TestTrading:
     def test_sell_reduces_balance(self, db, seed):

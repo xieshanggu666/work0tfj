@@ -1,6 +1,16 @@
 from datetime import datetime
 
-from sqlalchemy import Column, DateTime, ForeignKey, Integer, Numeric, String, UniqueConstraint
+from sqlalchemy import (
+    Column,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    Numeric,
+    String,
+    UniqueConstraint,
+    text,
+)
 
 from app.core.database import Base
 
@@ -21,7 +31,7 @@ class Quota(Base):
     allocation_amount = Column(Numeric(18, 4), nullable=False, default=0)  # 免费配额（tCO2）
     adjustment = Column(Numeric(18, 4), nullable=False, default=0)    # 调整量（可为负）
     total = Column(Numeric(18, 4), nullable=False, default=0)         # 最终配额
-    status = Column(String(16), nullable=False, default="pending")    # pending/allocated/cleared
+    status = Column(String(16), nullable=False, default="pending")    # pending/allocated/frozen/cleared
     allocated_at = Column(DateTime, nullable=True)
 
 
@@ -52,12 +62,13 @@ class AllowanceTransaction(Base):
     id = Column(Integer, primary_key=True)
     account_id = Column(Integer, ForeignKey("allowance_accounts.id"), nullable=False, index=True)
     company_id = Column(Integer, ForeignKey("companies.id"), nullable=False, index=True)
-    tx_type = Column(String(16), nullable=False)   # allocation/buy/sell/transfer/offset/clear
+    tx_type = Column(String(24), nullable=False)   # allocation/buy/sell/transfer_in/transfer_out/freeze/clear/frozen_clear/offset/reversal
     amount = Column(Numeric(18, 4), nullable=False, default=0)
     counterparty = Column(String(128), nullable=False, default="")
     price = Column(Numeric(18, 2), nullable=True)
     tx_date = Column(String(10), nullable=False, default="")
     balance_after = Column(Numeric(18, 4), nullable=False, default=0)
+    frozen_after = Column(Numeric(18, 4), nullable=False, default=0)
     remark = Column(String(256), nullable=False, default="")
     idempotency_key = Column(String(64), nullable=True)  # 客户端去重键（UUID），同账户唯一
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
@@ -68,16 +79,28 @@ class ComplianceRecord(Base):
 
     __tablename__ = "compliance_records"
     __table_args__ = (
-        UniqueConstraint("company_id", "year", name="uq_compliance_company_year"),
+        # 仅活跃记录保持企业+年度唯一；报告冲正归档后允许重新批准生成新记录。
+        # SQLite/PostgreSQL 使用部分索引，其他数据库降级为普通索引并由应用锁兜底。
+        Index(
+            "uq_compliance_active_company_year",
+            "company_id",
+            "year",
+            unique=True,
+            sqlite_where=text("is_active = 1"),
+            postgresql_where=text("is_active = 1"),
+        ),
     )
 
     id = Column(Integer, primary_key=True)
     company_id = Column(Integer, ForeignKey("companies.id"), nullable=False, index=True)
     year = Column(Integer, nullable=False, index=True)
-    verified_emission = Column(Numeric(18, 4), nullable=False, default=0)  # 核查后排放量
+    verified_emission = Column(Numeric(18, 4), nullable=False, default=0)  # 批准报告确认的排放量
     cleared_amount = Column(Numeric(18, 4), nullable=False, default=0)     # 已清缴配额
+    frozen_amount = Column(Numeric(18, 4), nullable=False, default=0)      # 批准后冻结、尚未清缴的配额
     deficit = Column(Numeric(18, 4), nullable=False, default=0)            # 缺口
-    status = Column(String(16), nullable=False, default="pending")         # pending/compliant/deficit
+    status = Column(String(16), nullable=False, default="pending")         # pending/compliant/deficit/reversed
     deadline = Column(String(10), nullable=False, default="")
+    report_id = Column(Integer, ForeignKey("mrv_reports.id"), nullable=True, index=True)
+    is_active = Column(Integer, nullable=False, default=1)                 # 0=报告冲正后归档，重新批准可建新记录
     idempotency_key = Column(String(64), nullable=True)  # 清缴请求去重键（全局唯一）
     cleared_at = Column(DateTime, nullable=True)

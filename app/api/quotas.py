@@ -57,6 +57,7 @@ def company_account(company_id: int, year: int, db: Session = Depends(get_db), u
         "opening_balance": float(account.opening_balance),
         "current_balance": float(account.current_balance),
         "frozen_balance": float(account.frozen_balance),
+        "available_balance": float(account.current_balance) - float(account.frozen_balance),
     }
 
 
@@ -110,6 +111,7 @@ def account_transactions(account_id: int, db: Session = Depends(get_db), user: U
             "price": float(t.price) if t.price is not None else None,
             "tx_date": t.tx_date,
             "balance_after": float(t.balance_after),
+            "frozen_after": float(t.frozen_after or 0),
             "remark": t.remark,
         }
         for t in txs
@@ -121,6 +123,7 @@ def list_compliance(year: int | None = None, db: Session = Depends(get_db), user
     q = db.query(ComplianceRecord)
     if user.role == "enterprise":
         q = q.filter(ComplianceRecord.company_id == user.company_id)
+    q = q.filter(ComplianceRecord.is_active == 1)
     if year is not None:
         q = q.filter(ComplianceRecord.year == year)
     items = q.order_by(ComplianceRecord.year.desc()).all()
@@ -131,8 +134,11 @@ def list_compliance(year: int | None = None, db: Session = Depends(get_db), user
             "year": r.year,
             "verified_emission": float(r.verified_emission),
             "cleared_amount": float(r.cleared_amount),
+            "frozen_amount": float(r.frozen_amount or 0),
             "deficit": float(r.deficit),
             "status": r.status,
+            "is_active": bool(r.is_active),
+            "report_id": r.report_id,
             "deadline": r.deadline,
             "cleared_at": r.cleared_at,
         }
@@ -161,5 +167,6 @@ def do_clear(
         "status": record.status,
         "verified_emission": float(record.verified_emission),
         "cleared_amount": float(record.cleared_amount),
+        "frozen_amount": float(record.frozen_amount or 0),
         "deficit": float(record.deficit),
     }

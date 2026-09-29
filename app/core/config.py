@@ -14,6 +14,6 @@ ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 8
 
 SCOPES = ["1", "2", "3"]
 PERIODS = ["monthly", "quarterly", "annual"]
-QUOTA_STATUSES = ["pending", "allocated", "cleared"]
-COMPLIANCE_STATUSES = ["pending", "compliant", "deficit"]
-REPORT_STATUSES = ["draft", "submitted", "approved"]
+QUOTA_STATUSES = ["pending", "allocated", "frozen", "cleared"]
+COMPLIANCE_STATUSES = ["pending", "compliant", "deficit", "reversed"]
+REPORT_STATUSES = ["draft", "submitted", "approved", "reversed"]

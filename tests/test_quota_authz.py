@@ -163,3 +163,15 @@ def test_transfer_cross_company_forbidden(ctx):
               "price": 1, "tx_date": "2025-06-01", "remark": "越权划转"},
     )
     assert res.status_code == 403
+
+
+def test_report_reverse_requires_regulator_role(ctx):
+    """企业用户不能冲正已批准报告；核查角色可进入业务校验（不存在则 404）。"""
+    client, _ = ctx
+    login(client, "ent1")
+    res = client.post("/api/reports/999999/reverse", json={"reason": "越权冲正测试"})
+    assert res.status_code == 403
+
+    login(client, "verifier")
+    res = client.post("/api/reports/999999/reverse", json={"reason": "记录不存在"})
+    assert res.status_code == 404

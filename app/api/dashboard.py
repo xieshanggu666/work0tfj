@@ -10,4 +10,4 @@ router = APIRouter(prefix="/api/dashboard", tags=["dashboard"])
 
 @router.get("/stats")
 def stats(year: int | None = None, db=Depends(get_db), user: User = Depends(get_current_user)):
-    return dashboard_stats(db, year)
+    return dashboard_stats(db, year, user)

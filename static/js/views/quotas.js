@@ -87,7 +87,7 @@ views.QuotaView = () => {
     try {
       // 清缴幂等键：重复点击/超时重发返回同一履约记录，不重复扣减
       const r = await api.post(`/api/companies/${c.company_id}/clear?year=${c.year}&deadline=${c.year}-12-31`, null, api.idemKey());
-      setMsg({ type: "ok", text: `清缴完成：状态 ${r.status}，缺口 ${fmtNum(r.deficit)} 吨` });
+      setMsg({ type: "ok", text: `清缴完成：状态 ${r.status === "deficit" ? "缺口" : r.status === "compliant" ? "达标" : "待清缴"}，缺口 ${fmtNum(r.deficit)} 吨` });
       api.get("/api/compliance").then(setCompliance);
       loadAccount();
     } catch (err) {
@@ -136,8 +136,9 @@ views.QuotaView = () => {
       ${account ? html`
         <div class="cards">
           <div class="card"><div class="label">期初配额</div><div class="value">${fmtNum(account.opening_balance)} t</div></div>
-          <div class="card"><div class="label">当前余额</div><div class="value">${fmtNum(account.current_balance)} t</div></div>
+          <div class="card"><div class="label">当前持仓</div><div class="value">${fmtNum(account.current_balance)} t</div></div>
           <div class="card"><div class="label">冻结配额</div><div class="value">${fmtNum(account.frozen_balance)} t</div></div>
+          <div class="card"><div class="label">可用余额</div><div class="value">${fmtNum(account.available_balance)} t</div></div>
         </div>
         <form class="form-grid" onSubmit=${doTransfer}>
           <div class="field"><label>类型</label>
@@ -154,7 +155,7 @@ views.QuotaView = () => {
           <div class="actions"><button class="btn" type="submit" disabled=${submitting}>${submitting ? "提交中…" : "提交交易"}</button></div>
         </form>
         <table style=${{marginTop: "16px"}}>
-          <thead><tr><th>ID</th><th>类型</th><th>数量 (t)</th><th>对手方</th><th>单价</th><th>日期</th><th>余额</th><th>备注</th></tr></thead>
+          <thead><tr><th>ID</th><th>类型</th><th>数量 (t)</th><th>对手方</th><th>单价</th><th>日期</th><th>持仓</th><th>冻结</th><th>备注</th></tr></thead>
           <tbody>
             ${txs.map((t) => html`
               <tr key=${t.id}>
@@ -165,9 +166,10 @@ views.QuotaView = () => {
                 <td>${t.price !== null ? fmtNum(t.price) + " 元" : "-"}</td>
                 <td>${t.tx_date || "-"}</td>
                 <td>${fmtNum(t.balance_after)}</td>
+                <td>${fmtNum(t.frozen_after)}</td>
                 <td>${t.remark || "-"}</td>
               </tr>`)}
-            ${txs.length === 0 && html`<tr><td colspan="8" class="empty">暂无交易记录</td></tr>`}
+            ${txs.length === 0 && html`<tr><td colspan="9" class="empty">暂无交易记录</td></tr>`}
           </tbody>
         </table>` : html`<div class="msg err">${msg.text || "该年度尚无配额账户，请先分配配额"}</div>`}
     </div>
@@ -175,7 +177,7 @@ views.QuotaView = () => {
     <div class="panel">
       <h3>年度履约</h3>
       <table>
-        <thead><tr><th>企业</th><th>年度</th><th>核查排放 (tCO2e)</th><th>已清缴 (t)</th><th>缺口 (t)</th><th>状态</th><th></th></tr></thead>
+        <thead><tr><th>企业</th><th>年度</th><th>核查排放 (tCO2e)</th><th>已清缴 (t)</th><th>冻结 (t)</th><th>缺口 (t)</th><th>状态</th><th></th></tr></thead>
         <tbody>
           ${compliance.map((r) => html`
             <tr key=${r.id}>
@@ -183,11 +185,12 @@ views.QuotaView = () => {
               <td>${r.year}</td>
               <td>${fmtNum(r.verified_emission)}</td>
               <td>${fmtNum(r.cleared_amount)}</td>
+              <td>${fmtNum(r.frozen_amount)}</td>
               <td>${fmtNum(r.deficit)}</td>
               <td>${html([StatusBadge(r.status)])}</td>
-              <td>${isAdmin && r.status === "pending" && html`<button class="btn sm" onClick=${() => doClear({ ...r, name: companies.find((c) => c.id === r.company_id)?.name })}>清缴</button>`}</td>
+              <td>${isAdmin && (r.status === "pending" || r.status === "deficit") && html`<button class="btn sm" onClick=${() => doClear({ ...r, name: companies.find((c) => c.id === r.company_id)?.name })}>${r.status === "deficit" ? "补缴/清缴" : "清缴"}</button>`}</td>
             </tr>`)}
-          ${compliance.length === 0 && html`<tr><td colspan="7" class="empty">暂无履约记录，核算并清缴后展示</td></tr>`}
+          ${compliance.length === 0 && html`<tr><td colspan="8" class="empty">暂无履约记录，报告批准或清缴后展示</td></tr>`}
         </tbody>
       </table>
     </div>

@@ -2,7 +2,7 @@
 
 并发安全保证：
 - 账户级键锁串行化同一账户的所有余额变更；
-- 余额扣减使用带非负条件的原子 UPDATE，并发下也不会超额扣减；
+- 扣减使用“可用余额（持仓 - 冻结）充足”的原子 UPDATE，冻结配额不可卖出；
 - 余额与流水在同一事务中提交，异常统一回滚；
 - 支持幂等键，重复提交（双击、网络重试）返回首笔流水，不重复入账。
 """
@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session
 from app.core.ledger import (
     InsufficientBalanceError,
     account_lock_key,
-    apply_balance_delta,
+    apply_ledger_delta,
     is_duplicate_submit,
     lock_rows_for_update,
     locked_accounts,
@@ -20,8 +20,8 @@ from app.core.ledger import (
 )
 from app.models.allowance import AllowanceAccount, AllowanceTransaction
 
-_INCREASE_TYPES = {"allocation", "buy", "transfer_in"}
-_DECREASE_TYPES = {"sell", "transfer_out", "offset", "clear"}
+_INCREASE_TYPES = {"buy", "transfer_in"}
+_DECREASE_TYPES = {"sell", "transfer_out"}
 
 
 def transfer(
@@ -63,9 +63,15 @@ def transfer(
         try:
             with transactional(db):
                 lock_rows_for_update(db, account.id)
+                account = db.get(AllowanceAccount, account.id)
                 delta = amount if tx_type in _INCREASE_TYPES else -amount
-                # 原子条件 UPDATE：最终余额由数据库计算，杜绝读改写竞态导致的超额扣减
-                balance_after = apply_balance_delta(db, account.id, delta)
+                # 原子条件 UPDATE：最终余额与冻结额由数据库计算。卖出/划出只能使用
+                # current - frozen 的可用部分，报告批准冻结的履约配额不得被交易占用。
+                if delta < 0:
+                    available = float(account.current_balance) - float(account.frozen_balance)
+                    if round(available, 4) < amount:
+                        raise InsufficientBalanceError("可用配额余额不足")
+                balance_after, frozen_after = apply_ledger_delta(db, account.id, delta, 0)
 
                 tx = AllowanceTransaction(
                     account_id=account.id,
@@ -76,6 +82,7 @@ def transfer(
                     price=round(price, 2) if price is not None else None,
                     tx_date=tx_date,
                     balance_after=balance_after,
+                    frozen_after=frozen_after,
                     remark=remark,
                     idempotency_key=idempotency_key,
                 )

@@ -4,7 +4,9 @@ from sqlalchemy.orm import Session
 from app.core.database import get_db
 from app.core.deps import ensure_company_access, get_current_user, require_roles
 from app.models import Company, MrvReport, User
-from app.services.mrv_service import approve_report, generate_report, submit_report
+from app.schemas import ReportReversalIn
+from app.services.mrv_service import generate_report, reverse_report, submit_report
+from app.services.quota_service import freeze_allowance_for_report
 
 router = APIRouter(prefix="/api", tags=["reports"])
 
@@ -24,6 +26,8 @@ def list_reports(company_id: int, db: Session = Depends(get_db), user: User = De
             "scope3": float(r.scope3),
             "status": r.status,
             "generated_at": r.generated_at,
+            "approved_at": r.approved_at,
+            "reversed_at": r.reversed_at,
         }
         for r in reports
     ]
@@ -58,10 +62,40 @@ def approve(report_id: int, db: Session = Depends(get_db), user: User = Depends(
     if not report:
         raise HTTPException(status_code=404, detail="报告不存在")
     try:
-        approve_report(db, report, user.id)
+        record = freeze_allowance_for_report(db, report, user.id)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-    return {"id": report.id, "status": report.status}
+    return {
+        "id": report.id,
+        "status": report.status,
+        "compliance_id": record.id,
+        "frozen_amount": float(record.frozen_amount or 0),
+        "deficit": float(record.deficit),
+    }
+
+
+@router.post("/reports/{report_id}/reverse")
+def reverse(
+    report_id: int,
+    data: ReportReversalIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_roles("verifier", "admin")),
+):
+    report = db.get(MrvReport, report_id)
+    if not report:
+        raise HTTPException(status_code=404, detail="报告不存在")
+    try:
+        record = reverse_report(db, report, user.id, data.reason)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {
+        "id": report.id,
+        "status": report.status,
+        "compliance_id": record.id,
+        "cleared_amount": float(record.cleared_amount),
+        "frozen_amount": float(record.frozen_amount),
+        "deficit": float(record.deficit),
+    }
 
 
 @router.get("/reports/{report_id}")
@@ -82,4 +116,6 @@ def report_detail(report_id: int, db: Session = Depends(get_db), user: User = De
         "status": report.status,
         "generated_at": report.generated_at,
         "approved_at": report.approved_at,
+        "reversed_at": report.reversed_at,
+        "reversal_reason": report.reversal_reason,
     }

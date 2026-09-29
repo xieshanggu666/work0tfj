@@ -14,6 +14,7 @@ from app.models import (  # noqa: E402
     ActivityData,
     AllowanceAccount,
     CalculationMethod,
+    ComplianceRecord,
     Company,
     EmissionFactor,
     EmissionScope,
@@ -21,8 +22,13 @@ from app.models import (  # noqa: E402
     User,
 )
 from app.services.calculation_service import recalc_company_year  # noqa: E402
+from app.services.mrv_service import (  # noqa: E402
+    approve_report,
+    generate_report,
+    submit_report,
+)
 from app.services.quota_service import allocate_quota, clear_emission  # noqa: E402
-from app.services.mrv_service import generate_report  # noqa: E402
+from app.services.trading_service import transfer as transfer_allowance  # noqa: E402
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
@@ -103,17 +109,32 @@ def main():
     for c in companies:
         recalc_company_year(db, c.id, year)
 
-    allocate_quota(db, companies[0].id, year, baseline=2200000, allocation_amount=2150000, adjustment=-30000)
-    allocate_quota(db, companies[1].id, year, baseline=560000, allocation_amount=540000, adjustment=-10000)
-
-    clear_emission(db, companies[0].id, year, f"{year}-12-31")
+    allocate_quota(db, companies[0].id, year, baseline=2200000, allocation_amount=1120000, adjustment=-20000)
+    allocate_quota(db, companies[1].id, year, baseline=560000, allocation_amount=570000, adjustment=-10000)
 
     for c in companies:
-        generate_report(db, c.id, year)
+        report = generate_report(db, c.id, year)
+        submit_report(db, report)
+        approve_report(db, report, verifier_id=users[1].id)
+
+    # 绿能电力冻结后仍有缺口，买入配额后补缴；恒固水泥在批准冻结时即足额
+    clear_emission(db, companies[0].id, year, f"{year}-12-31")
+    elec_account = db.query(AllowanceAccount).filter_by(company_id=companies[0].id, year=year).one()
+    elec_record = db.query(ComplianceRecord).filter_by(company_id=companies[0].id, year=year, is_active=1).one()
+    transfer_allowance(
+        db,
+        elec_account,
+        float(elec_record.deficit),
+        "buy",
+        counterparty="碳市场",
+        tx_date=f"{year}-12-20",
+    )
+    clear_emission(db, companies[0].id, year, f"{year}-12-31")
+    clear_emission(db, companies[1].id, year, f"{year}-12-31")
 
     db.commit()
     db.close()
-    print("初始化完成：2 家企业、4 个核算边界、3 个排放因子、4 条活动数据（2025）、2 份配额、1 条履约记录、2 份 MRV 报告")
+    print("初始化完成：2 家企业、4 个核算边界、3 个排放因子、4 条活动数据（2025）、2 份配额、2 份已批准 MRV 报告、2 条履约记录（含 1 次缺口补缴）")
     print("账号：admin / verifier / elec / cement，密码均为 123456")
 
 

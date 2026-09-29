@@ -60,27 +60,41 @@ def _fresh_session(db):
 
 
 def _tx_snapshot_consistent(db, account_id):
-    """流水不变量：第 N 笔的 balance_after = 第 N-1 笔 + 本笔带符号金额，
-    且末笔快照等于账户当前余额。"""
+    """流水不变量：持仓/冻结快照逐笔可推算，且末笔快照等于账户当前值。"""
     txs = (
         db.query(AllowanceTransaction)
         .filter(AllowanceTransaction.account_id == account_id)
         .order_by(AllowanceTransaction.id.asc())
         .all()
     )
-    signs = {
-        "allocation": 1, "buy": 1, "transfer_in": 1,
+    current_signs = {
+        "allocation": 1, "buy": 1, "transfer_in": 1, "reversal": 1,
         "sell": -1, "transfer_out": -1, "offset": -1, "clear": -1,
+        "frozen_clear": -1, "freeze": 0,
     }
-    expected = 0.0
+    frozen_signs = {
+        "freeze": 1, "frozen_clear": -1, "reversal": -1,
+    }
+    expected_current = 0.0
+    expected_frozen = 0.0
     for tx in txs:
-        expected = round(expected + signs[tx.tx_type] * float(tx.amount), 4)
-        assert float(tx.balance_after) == approx(expected), (
-            f"流水 #{tx.id} 快照 {tx.balance_after} 与推算余额 {expected} 不一致"
+        expected_current = round(
+            expected_current + current_signs.get(tx.tx_type, 0) * float(tx.amount), 4
+        )
+        expected_frozen = round(
+            expected_frozen + frozen_signs.get(tx.tx_type, 0) * float(tx.amount), 4
+        )
+        assert float(tx.balance_after) == approx(expected_current), (
+            f"流水 #{tx.id} 持仓快照 {tx.balance_after} 与推算持仓 {expected_current} 不一致"
+        )
+        assert float(tx.frozen_after or 0) == approx(expected_frozen), (
+            f"流水 #{tx.id} 冻结快照 {tx.frozen_after} 与推算冻结 {expected_frozen} 不一致"
         )
     account = db.get(AllowanceAccount, account_id)
-    assert float(account.current_balance) == approx(expected)
-    return expected, txs
+    assert float(account.current_balance) == approx(expected_current)
+    assert float(account.frozen_balance) == approx(expected_frozen)
+    assert float(account.frozen_balance) <= float(account.current_balance) + 1e-9
+    return expected_current, txs
 
 
 class TestConcurrentTransfer:

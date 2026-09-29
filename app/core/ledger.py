@@ -102,41 +102,49 @@ def lock_rows_for_update(db: Session, account_id: int) -> None:
         db.expire_all()
 
 
+def apply_ledger_delta(
+    db: Session,
+    account_id: int,
+    current_delta: float = 0,
+    frozen_delta: float = 0,
+) -> tuple[float, float]:
+    """原子更新账户当前余额与履约冻结额，返回更新后的 ``(当前余额, 冻结额)``。
+
+    数据库条件同时保证：当前余额非负、冻结额非负、冻结额不超过当前余额。
+    因此交易校验的是“可用余额（current - frozen）”，报告批准后的冻结配额
+    不能再被卖出或划出；冻结、清缴、冲正在并发下也不会破坏账本不变量。
+    """
+    current_amount = round(current_delta, 4)
+    frozen_amount = round(frozen_delta, 4)
+    current_expr = AllowanceAccount.current_balance + current_amount
+    frozen_expr = AllowanceAccount.frozen_balance + frozen_amount
+
+    stmt = (
+        update(AllowanceAccount)
+        .where(AllowanceAccount.id == account_id)
+        .where(current_expr >= 0)
+        .where(frozen_expr >= 0)
+        .where(current_expr >= frozen_expr)
+        .values(current_balance=current_expr, frozen_balance=frozen_expr)
+    )
+    result = db.execute(stmt.execution_options(synchronize_session=False))
+    if result.rowcount != 1:
+        raise InsufficientBalanceError("可用配额余额不足")
+    # UPDATE 绕开 ORM 状态同步，必须使身份映射中的旧对象失效后再读
+    db.expire_all()
+    db.flush()
+    refreshed = db.get(AllowanceAccount, account_id)
+    return round(float(refreshed.current_balance), 4), round(float(refreshed.frozen_balance), 4)
+
+
 def apply_balance_delta(
     db: Session,
     account_id: int,
     delta: float,
 ) -> float:
-    """对账户余额执行单条原子条件 UPDATE，返回更新后的余额。
-
-    - delta >= 0：入账，直接累加；
-    - delta <  0：扣减，仅当扣减后不为负时 WHERE 条件成立，
-      影响行数为 0 说明发生了并发超额扣减，抛出 InsufficientBalanceError。
-    结果由数据库计算，不依赖调用方先前读到的余额快照。
-    """
-    amount = round(abs(delta), 4)
-    if delta < 0:
-        stmt = (
-            update(AllowanceAccount)
-            .where(AllowanceAccount.id == account_id, AllowanceAccount.current_balance >= amount)
-            .values(current_balance=AllowanceAccount.current_balance - amount)
-        )
-    else:
-        stmt = (
-            update(AllowanceAccount)
-            .where(AllowanceAccount.id == account_id)
-            .values(current_balance=AllowanceAccount.current_balance + amount)
-        )
-    # 不做 ORM 内存态同步（Numeric 列是 Decimal，与 Python float 直接相减会报错），
-    # 余额以数据库更新后重新读取的值为准
-    result = db.execute(stmt.execution_options(synchronize_session=False))
-    if result.rowcount != 1:
-        raise InsufficientBalanceError("配额余额不足")
-    # UPDATE 绕开了 ORM 状态同步，必须使身份映射中的旧对象失效后再读，否则拿到的是旧余额
-    db.expire_all()
-    db.flush()
-    refreshed = db.get(AllowanceAccount, account_id)
-    return round(float(refreshed.current_balance), 4)
+    """对账户当前余额执行单条原子条件 UPDATE，返回更新后的余额。"""
+    balance, _ = apply_ledger_delta(db, account_id, current_delta=delta)
+    return balance
 
 
 def is_duplicate_submit(exc: IntegrityError, column: str = "idempotency_key") -> bool:
